@@ -71,8 +71,8 @@ from flax import jax_utils
 from flax.jax_utils import unreplicate
 from flax.training import train_state
 from flax.training.common_utils import get_metrics, shard, shard_prng_key
-from modeling_hybrid_clip import FlaxHybridCLIP
-from configuration_hybrid_clip import HybridCLIPConfig
+from hybrid_clip.modeling_hybrid_clip import FlaxHybridCLIP
+from hybrid_clip.configuration_hybrid_clip import HybridCLIPConfig
 from transformers import (
     AutoTokenizer,
     HfArgumentParser,
@@ -329,7 +329,12 @@ class ImageTextDataset(VisionDataset):
         return im
 
     def _load_target(self, idx):
-        return self.rand_generator.choice(self.captions[idx])
+        try:
+            return self.rand_generator.choice(self.captions[idx])
+        except:
+            # print(idx)
+            # print(self.captions[idx])
+            return ""
         # if len(self.captions[idx]) > 1:
         #     caption_idx = np.random.randint(0, len(self.captions[idx]))
         # else:
@@ -388,24 +393,20 @@ def log_on_comet(experiment, train_metrics, eval_metrics, train_time, step):
 def setup_comet(exp_name):
     logger.info("Comet ML logging requested")
     try:
+        COMET_API_KEY=""
+        # Create an experiment with your api key
+        experiment = Experiment(
+            api_key=COMET_API_KEY,
+            project_name="clip-finetune",
+            workspace="kaywong",
+            log_code=True,
+            log_graph=False,
+        )
+        experiment.add_tag("training")
 
-        if "COMET_API_KEY" in os.environ:
-            # Create an experiment with your api key
-            experiment = Experiment(
-                api_key=os.environ["COMET_API_KEY"],
-                project_name="clip-italian",
-                workspace="g8a9",
-                log_code=True,
-                log_graph=False,
-            )
-            experiment.add_tag("training")
-
-            if exp_name is not None:
-                experiment.set_name(exp_name)
-            return experiment
-        else:
-            logger.info("Can't find COMET_API_KEY env variable, disabling Comet")
-            return None
+        if exp_name is not None:
+            experiment.set_name(exp_name)
+        return experiment
 
     except:
         logger.info("Something went wrong initializing Comet")
@@ -456,6 +457,8 @@ def main():
     parser.add_argument("--exp_name", type=str, default=None)
     parser.add_argument("--eval_when", type=int, default=1)
     parser.add_argument("--run_from_checkpoint", type=str, default=None)
+    parser.add_argument("--epoch_offset", type=int, default=0)
+    #parser.add_argument("--hf_output_dir", type=str, default="clip-twt-blr-finetuned")
 
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
         # If we pass only one argument to the script and it's the path to a json file,
@@ -520,18 +523,19 @@ def main():
         comet_exp = setup_comet(args.exp_name)
 
     eval_when = args.eval_when
+    epoch_offset = int(args.epoch_offset)
 
     if args.run_from_checkpoint is not None:
         with open(f"{args.run_from_checkpoint}/config.json", "r") as fp:
             config_dict = json.load(fp)
         config_dict["vision_config"]["model_type"] = "clip"
-        config = HybridCLIPConfig(**config_dict)
+        clip_config = HybridCLIPConfig(**config_dict)
         model = FlaxHybridCLIP.from_pretrained(
             args.run_from_checkpoint,
             seed=training_args.seed,
             dtype=getattr(jnp, model_args.dtype),
-            config=config,
-            freeze_backbones=args.freeze_backbones
+            freeze_backbones=args.freeze_backbones,
+            config=clip_config
         )
     else:
 
@@ -540,7 +544,7 @@ def main():
             model_args.vision_model_name_or_path,
             seed=training_args.seed,
             dtype=getattr(jnp, model_args.dtype),
-            text_from_pt=False,
+            text_from_pt=True,
             vision_from_pt=model_args.from_pt,
             freeze_backbones=args.freeze_backbones
         )
@@ -776,7 +780,7 @@ def main():
 
         train_step_progress_bar.close()
         epochs.write(
-            f"Epoch... ({epoch + 1}/{num_epochs} | Loss: {train_metric['loss']}, Learning Rate: {train_metric['learning_rate']})"
+            f"Epoch... ({epoch + 1 + epoch_offset}/{num_epochs + epoch_offset} | Loss: {train_metric['loss']}, Learning Rate: {train_metric['learning_rate']})"
         )
 
         # ======================== Evaluating ==============================
@@ -799,32 +803,33 @@ def main():
             # normalize eval metrics
             eval_metrics = get_metrics(eval_metrics)
 
-            eval_metrics = jax.tree_map(jnp.mean, eval_metrics)
+            eval_metrics = jax.tree_map(jnp.mean, eval_metrics) #jav<=0.2.17
+            #eval_metrics = jax.tree_util.tree_map(jnp.mean, eval_metrics) #jax>0.2.18
 
             # Print metrics and update progress bar
             eval_step_progress_bar.close()
-            desc = f"Epoch... ({epoch + 1}/{num_epochs} | Eval Loss: {eval_metrics['loss']})"
+            desc = f"Epoch... ({epoch + 1 + epoch_offset}/{num_epochs+epoch_offset} | Eval Loss: {eval_metrics['loss']})"
             epochs.write(desc)
             epochs.desc = desc
 
         # Save metrics
         if has_tensorboard and jax.process_index() == 0:
-            cur_step = epoch * (len(train_dataset) // train_batch_size)
+            cur_step = (epoch+epoch_offset) * (len(train_dataset) // train_batch_size)
             write_metric(
                 summary_writer, train_metrics, eval_metrics, train_time, cur_step
             )
         if args.log_comet and comet_exp is not None and jax.process_index() == 0:
-            cur_step = epoch * (len(train_dataset) // train_batch_size)
+            cur_step = (epoch+epoch_offset) * (len(train_dataset) // train_batch_size)
             log_on_comet(comet_exp, train_metrics, eval_metrics, train_time, cur_step)
 
         # save checkpoint after each epoch and push checkpoint to the hub
         if jax.process_index() == 0:
             params = jax.device_get(unreplicate(state.params))
             model.save_pretrained(
-                training_args.output_dir + f"/{epoch+1}/",
+                training_args.output_dir + f"/{epoch+1+epoch_offset}/",
                 params=params,
                 push_to_hub=training_args.push_to_hub,
-                commit_message=f"Saving weights and logs of epoch {epoch+1}",
+                commit_message=f"Saving weights and logs of epoch {epoch+1+epoch_offset}",
             )
 
 
